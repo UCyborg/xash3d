@@ -214,7 +214,16 @@ void IN_EvdevFrame ()
 			ioctl( mouse_fd, EVIOCGRAB, (void*) 0);
 			Key_Event( K_ESCAPE, 0 ); //Do not leave ESC down
 		}
+		if(clgame.dllFuncs.pfnLookEvent)
+			clgame.dllFuncs.pfnLookEvent( evdev_dx, evdev_dy );
+		else
+		{
+			cl.refdef.cl_viewangles[PITCH] += evdev_dy * m_enginesens->value;
+			cl.refdef.cl_viewangles[PITCH] = bound( -90, cl.refdef.cl_viewangles[PITCH], 90 );
+			cl.refdef.cl_viewangles[YAW] -= evdev_dx * m_enginesens->value;
+		}
 	}
+	
 }
 #endif
 
@@ -522,6 +531,85 @@ void IN_MouseEvent( int mstate )
 	in_mouse_oldbuttonstate = mstate;
 }
 
+#ifdef XASH_SDL
+/*
+==========================
+SDL Joystick Code
+==========================
+*/
+
+struct sdl_joydada_s
+{
+	qboolean open;
+	int num_axes;
+	char binding[10];
+	SDL_Joystick *joy;
+} joydata;
+
+
+convar_t *joy_index;
+convar_t *joy_binding;
+convar_t *joy_pitch;
+convar_t *joy_yaw;
+convar_t *joy_forward;
+convar_t *joy_side;
+convar_t *joy_enable;
+void IN_SDL_JoyMove( float *forward, float *side, float *pitch, float *yaw )
+{
+	int i;
+	if(!joydata.joy) return;
+	// Extend cvar with zeroes
+	if(joy_binding->modified)
+	{
+		Q_strncpy(joydata.binding, joy_binding->string, 10);
+		Q_strncat(joydata.binding,"0000000000", joydata.num_axes);
+		joy_binding->modified = false;
+	}
+	for(i = 0; i < joydata.num_axes; i++)
+	{
+		signed short value = SDL_JoystickGetAxis( joydata.joy, i );
+		if( value <= 3200 && value >= -3200 ) continue;
+		switch(joy_binding->string[i])
+		{
+			case 'f': *forward -= joy_forward->value/32768.0 * value;break;
+			case 's': *side += joy_side->value/32768.0 * value;break;
+			case 'p': *pitch += joy_pitch->value/32768.0 *value;break;
+			case 'y': *yaw -= joy_yaw->value/32768.0 * value;break;
+			default:break;
+		}
+	}
+}
+
+
+void IN_SDL_JoyInit( void )
+{
+	int num;
+	joydata.joy = 0;
+	joy_binding = Cvar_Get( "joy_binding", "sfyp", CVAR_ARCHIVE, "Joystick binding (f/s/p/y)" );
+	joy_binding->modified = true;
+	joy_index = Cvar_Get( "joy_index" ,"0" , CVAR_ARCHIVE, "Joystick number to open" );
+	joy_enable = Cvar_Get( "joy_enable" ,"1" , CVAR_ARCHIVE, "Enable joystick" );
+	joy_pitch = Cvar_Get( "joy_pitch" ,"1.0" , CVAR_ARCHIVE, "Joystick pitch sensitivity" );
+	joy_yaw = Cvar_Get( "joy_yaw" ,"1.0" , CVAR_ARCHIVE, "Joystick yaw sensitivity" );
+	joy_side = Cvar_Get( "joy_side" ,"1.0" , CVAR_ARCHIVE, "Joystick side sensitivity" );
+	joy_forward = Cvar_Get( "joy_forward" ,"1.0" , CVAR_ARCHIVE, "Joystick forward sensitivity" );
+	if (!joy_enable->integer) return;
+	
+	if( ( num = SDL_NumJoysticks() ) )
+	{
+		MsgDev ( D_INFO, "%d joysticks found\n", num );
+		joydata.joy = SDL_JoystickOpen(joy_index->integer);
+		if(!joydata.joy)
+		{
+			MsgDev ( D_ERROR, "Failed to open joystick!\n");
+		}
+		joydata.num_axes = SDL_JoystickNumAxes(joydata.joy);
+		MsgDev ( D_INFO, "Joystick %s has %d axes\n", SDL_JoystickName(joydata.joy), joydata.num_axes );
+	}
+}
+
+#endif
+
 /*
 ===========
 IN_Shutdown
@@ -549,6 +637,9 @@ void IN_Init( void )
 	cl_forwardspeed	= Cvar_Get( "cl_forwardspeed", "400", CVAR_ARCHIVE | CVAR_CLIENTDLL, "Default forward move speed" );
 	cl_backspeed	= Cvar_Get( "cl_backspeed", "400", CVAR_ARCHIVE | CVAR_CLIENTDLL, "Default back move speed"  );
 	cl_sidespeed	= Cvar_Get( "cl_sidespeed", "400", CVAR_ARCHIVE | CVAR_CLIENTDLL, "Default side move speed"  );
+#ifdef XASH_SDL
+	IN_SDL_JoyInit();
+#endif
 #ifdef USE_EVDEV
 	evdev_mousepath	= Cvar_Get( "evdev_mousepath", "", 0, "Path for evdev device node");
 	evdev_grab = Cvar_Get( "evdev_grab", "0", CVAR_ARCHIVE, "Enable event device grab" );
@@ -575,7 +666,7 @@ Common function for engine joystick movement
 #define R 1<<3	// Right
 #define T 1<<4	// Forward stop
 #define S 1<<5	// Side stop
-void IN_JoyMove( usercmd_t *cmd, float forwardmove, float sidemove )
+void IN_JoyAppendMove( usercmd_t *cmd, float forwardmove, float sidemove )
 {
 	static uint moveflags = T | S;
 		
@@ -643,25 +734,29 @@ void IN_JoyMove( usercmd_t *cmd, float forwardmove, float sidemove )
 
 /*
 ================
-IN_EngineMove
+IN_EngineAppendMove
 
 Called from cl_main.c after generating command in client
 ================
 */
-void IN_EngineMove( float frametime, usercmd_t *cmd, qboolean active )
+void IN_EngineAppendMove( float frametime, usercmd_t *cmd, qboolean active )
 {
-#ifdef __ANDROID__
+	float forward = 0, side = 0;
+	if(clgame.dllFuncs.pfnLookEvent)
+		return;
 	if(active)
-		Android_Move(cmd);
-#endif
-#ifdef USE_EVDEV
-	if(evdev_open)
 	{
-		cl.refdef.cl_viewangles[PITCH] += evdev_dy * m_enginesens->value;
-		cl.refdef.cl_viewangles[PITCH] = bound( -90, cl.refdef.cl_viewangles[PITCH], 90 );
-		cl.refdef.cl_viewangles[YAW] -= evdev_dx * m_enginesens->value;
-	}
+#ifdef __ANDROID__
+		Android_Move( &forward, &side, &cl.refdef.cl_viewangles[PITCH], &cl.refdef.cl_viewangles[YAW] );
 #endif
+#ifdef XASH_SDL
+		IN_SDL_JoyMove( &forward, &side, &cl.refdef.cl_viewangles[PITCH], &cl.refdef.cl_viewangles[YAW] );
+#endif
+		IN_JoyAppendMove( cmd, forward, side );
+
+	}
+
+
 }
 /*
 ==================
@@ -673,11 +768,36 @@ Called every frame, even if not generating commands
 void Host_InputFrame( void )
 {
 	qboolean	shutdownMouse = false;
+	float forward = 0, side = 0, pitch = 0, yaw = 0;
 
 	rand (); // keep the random time dependent
 
 	Sys_SendKeyEvents ();
 
+#ifdef __ANDROID__
+	Android_Events();
+#endif
+
+#ifdef USE_EVDEV
+	IN_EvdevFrame();
+#endif
+	if(clgame.dllFuncs.pfnLookEvent)
+	{
+		int dx, dy;
+#ifdef __ANDROID__
+		Android_Move( &forward, &side, &pitch, &yaw );
+#endif
+#ifdef XASH_SDL
+		IN_SDL_JoyMove( &forward, &side, &pitch, &yaw );
+		if( in_mouseinitialized )
+		{
+			SDL_GetRelativeMouseState( &dx, &dy );
+			pitch +=dy, yaw +=dx;
+		}
+#endif
+		clgame.dllFuncs.pfnLookEvent(yaw * 50, pitch * 50);
+		clgame.dllFuncs.pfnMoveEvent(forward, side);
+	}
 	Cbuf_Execute ();
 
 	if( host.state == HOST_RESTART )
@@ -723,9 +843,6 @@ void Host_InputFrame( void )
 
 	IN_ActivateMouse( false );
 	IN_MouseMove();
-#ifdef USE_EVDEV
-	IN_EvdevFrame();
-#endif
 }
 
 /*
