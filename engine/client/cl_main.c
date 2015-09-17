@@ -1521,13 +1521,10 @@ void CL_ProcessFile( qboolean successfully_received, const char *filename )
 {
 	MsgDev( D_INFO, "Received %s, but file processing is not hooked up!!!\n", filename );
 
-	if( Q_strstr( filename, ".wad") )
-		FS_Rescan();
-
 	if( cls.downloadfileid == cls.downloadcount - 1 )
 	{
 		MsgDev( D_INFO, "All Files downloaded\n" );
-
+		FS_Rescan_f();
 		BF_WriteByte( &cls.netchan.message, clc_stringcmd );
 		BF_WriteString( &cls.netchan.message, "continueloading" );
 	}
@@ -1787,7 +1784,9 @@ void Host_ClientFrame( void )
 
 		SCR_RunCinematic();
 	}
-	
+
+	HTTP_Run();
+
 	Con_RunConsole();
 
 	cls.framecount++;
@@ -1812,6 +1811,8 @@ void CL_Init( void )
 
 	R_Init();	// init renderer
 	S_Init();	// init sound
+
+	HTTP_Init();
 
 	// unreliable buffer. unsed for unreliable commands and voice stream
 	BF_Init( &cls.datagram, "cls.datagram", cls.datagram_buf, sizeof( cls.datagram_buf ));
